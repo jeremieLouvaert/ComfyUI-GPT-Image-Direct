@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-gpt-image-direct"
+description = "Direct OpenAI GPT Image 2.5 (Flare / Sunburst), GPT Image 2, 1.5 and 1-mini generation and editing with your own API key: no credits middleman, exact USD cost per run"
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = ["requests", "Pillow"]
+
+[project.urls]
+Repository = "https://github.com/jeremieLouvaert/ComfyUI-GPT-Image-Direct"
+
+[tool.comfy]
+PublisherId = "akurate"
+DisplayName = "ComfyUI GPT Image Direct"
+Icon = ""
