@@ -93,7 +93,7 @@ def run_offline():
     usage = {"total_tokens": 1780, "input_tokens": 24, "output_tokens": 1756,
              "input_tokens_details": {"text_tokens": 24, "image_tokens": 0}}
     fake_requests.post = make_fake_post(usage=usage, w=96, h=64)
-    imgs, masks, cost_info, cache_key = node.generate(
+    imgs, masks, cost_info, cache_key, _svg = node.generate(
         prompt="a red chair", model="gpt-image-2.5-flare", quality="high", size="1536x1024",
         custom_width=1024, custom_height=1024, background="auto", output_format="png",
         output_compression=90, moderation="low", n=1, seed=7)
@@ -132,7 +132,7 @@ def run_offline():
     ref = torch.rand(1, 300, 200, 3)
     m = torch.zeros(1, 150, 100)
     m[0, :75, :] = 1.0  # top half repaint
-    imgs, masks, cost_info, cache_key = node.generate(
+    imgs, masks, cost_info, cache_key, _svg = node.generate(
         prompt="make it blue", model="gpt-image-2.5-sunburst", quality="medium", size="auto",
         custom_width=1024, custom_height=1024, background="auto", output_format="jpeg",
         output_compression=80, moderation="auto", n=1, seed=1, images=ref, mask=m,
@@ -156,7 +156,7 @@ def run_offline():
     CAPTURED.clear()
     fake_requests.post = make_fake_post(usage=usage, n=2)
     ref3 = torch.rand(3, 2600, 1300, 3)
-    imgs, masks, _, _ = node.generate(
+    imgs, masks, _, _, _ = node.generate(
         prompt="combine", model="gpt-image-2", quality="low", size="1024x1024",
         custom_width=1024, custom_height=1024, background="auto", output_format="png",
         output_compression=90, moderation="low", n=2, seed=1, images=ref3, reference_max_size="1024")
@@ -213,7 +213,7 @@ def run_offline():
     print("[6] transparency")
     CAPTURED.clear()
     fake_requests.post = make_fake_post(usage=usage, rgba=True)
-    imgs, masks, _, _ = node.generate(
+    imgs, masks, _, _, _ = node.generate(
         prompt="logo", model="gpt-image-2.5-flare", quality="low", size="1024x1024",
         custom_width=1024, custom_height=1024, background="transparent", output_format="jpeg",
         output_compression=90, moderation="low", n=1, seed=1)
@@ -236,11 +236,111 @@ def run_offline():
     # ---- 8. no usage -> estimated ----------------------------------------------
     print("[8] missing usage")
     fake_requests.post = make_fake_post(usage=None)
-    _, _, cost_info, _ = node.generate(
+    _, _, cost_info, _, _ = node.generate(
         prompt="x", model="gpt-image-2.5-flare", quality="low", size="1024x1024",
         custom_width=1024, custom_height=1024, background="auto", output_format="png",
         output_compression=90, moderation="low", n=1, seed=1)
     check("(estimated)" in cost_info, "falls back to estimate label without usage")
+
+    # ---- 9. GPT Image 2.6 features ---------------------------------------------
+    print("[9] 2.6: complexity, gif, svg, markup")
+    base = dict(custom_width=1024, custom_height=1024, background="auto",
+                output_compression=90, moderation="low", seed=3)
+
+    def raw_post(payload_bytes, extra=None):
+        def fake_post(url, headers=None, json=None, data=None, files=None, timeout=None):
+            CAPTURED.append({"url": url, "json": json, "data": data, "files": files})
+            body = {"created": 1, "data": [{"b64_json": base64.b64encode(payload_bytes).decode()}],
+                    "usage": {"input_tokens": 10, "output_tokens": 100}}
+            body.update(extra or {})
+            return FakeResponse(200, body)
+        return fake_post
+
+    # complexity sent on 2.6, keyed into cache_key; default keeps the old key shape
+    CAPTURED.clear()
+    fake_requests.post = make_fake_post(usage={"output_tokens": 10})
+    _, _, _, key_cx, _ = node.generate(prompt="p", model="gpt-image-2.6-flare", quality="low", size="1024x1024",
+                                       output_format="png", n=1, complexity="low", **base)
+    check(CAPTURED[-1]["json"].get("complexity") == "low", "complexity sent on 2.6")
+    e26, e25 = gid.estimate_cost("gpt-image-2.6-flare", "low", 1, 0), gid.estimate_cost("gpt-image-2.5-flare", "low", 1, 0)
+    check(abs(e26 - 0.0247) < 0.001 and e25 < 0.01, f"2.6 low estimate {e26:.4f} (measured 0.0247), 2.5 unchanged")
+    check("|complexity=low|" in key_cx, "complexity in cache_key")
+    _, _, _, key_def, _ = node.generate(prompt="p", model="gpt-image-2.6-flare", quality="low", size="1024x1024",
+                                        output_format="png", n=1, **base)
+    check("complexity" not in CAPTURED[-1]["json"] and "complexity" not in key_def, "auto complexity not sent, key unchanged")
+    node.generate(prompt="p", model="gpt-image-2.5-flare", quality="low", size="1024x1024",
+                  output_format="png", n=1, complexity="low", **base)
+    check("complexity" not in CAPTURED[-1]["json"], "control: complexity dropped for 2.5")
+
+    # gif: params sent, frames decoded into a batch, raw file saved
+    frames = [Image.new("RGB", (32, 24), c) for c in ((255, 0, 0), (0, 255, 0), (0, 0, 255))]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100, loop=0)
+    CAPTURED.clear()
+    fake_requests.post = raw_post(buf.getvalue())
+    imgs, masks, cost_info, key_gif, svg = node.generate(
+        prompt="p", model="gpt-image-2.6-flare", quality="low", size="1024x1024",
+        output_format="gif", n=1, frame_count=3, frame_duration_ms=100, **base)
+    js = CAPTURED[-1]["json"]
+    check(js["output_format"] == "gif" and js["frame_count"] == 3 and js["frame_duration_ms"] == 100, "gif params sent")
+    check("size" not in js, "gif: preset size dropped (sprite sheet limit)")
+    check(tuple(imgs.shape) == (3, 24, 32, 3) and tuple(masks.shape) == (3, 24, 32), f"gif -> 3-frame batch {tuple(imgs.shape)}")
+    check(float(imgs[1, 0, 0, 1]) > 0.9 and float(imgs[1, 0, 0, 0]) < 0.1, "frame 2 is green (frames not collapsed)")
+    check("(3 frames)" in cost_info and ".gif" in cost_info and "|gif=3x100ms|" in key_gif, "gif cost_info + cache_key")
+    try:
+        node.generate(prompt="p", model="gpt-image-2.5-flare", quality="low", size="1024x1024",
+                      output_format="gif", n=1, **base)
+        check(False, "control: gif on 2.5 rejected")
+    except ValueError:
+        check(True, "control: gif on 2.5 rejected")
+
+    # svg: generation-only, text out, placeholder image, n forced 1
+    svg_src = '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>'
+    CAPTURED.clear()
+    fake_requests.post = raw_post(svg_src.encode(), {"svg_usage": {"total_tokens": 321, "model": "gpt-x"}})
+    imgs, _, cost_info, key_svg, svg = node.generate(prompt="p", model="gpt-image-2.6-sunburst", quality="low",
+                                                     size="1536x1024", output_format="svg", n=3, **base)
+    check(f"|svg={gid.DEFAULT_SVG_MODEL}|" in key_svg, "svg model in cache_key")
+    check(svg == svg_src, "svg text returned verbatim")
+    check(CAPTURED[-1]["json"].get("svg") == {"model": gid.DEFAULT_SVG_MODEL}, "svg.model sent by default")
+    check(CAPTURED[-1]["json"]["n"] == 1 and "output_compression" not in CAPTURED[-1]["json"], "svg forces n=1, no compression")
+    check(tuple(imgs.shape) == (1, 1024, 1536, 3), "svg placeholder at requested size")
+    check("+321 SVG-authoring tokens" in cost_info, "svg authoring tokens surfaced")
+    fake_requests.post = raw_post(svg_src.encode(), {"size": "1312x1199"})
+    imgs, _, _, _, _ = node.generate(prompt="p", model="gpt-image-2.6-flare", quality="low", size="auto",
+                                     output_format="svg", n=1, svg_model="", **base)
+    check("svg" not in CAPTURED[-1]["json"], "empty svg_model -> svg object omitted")
+    check(tuple(imgs.shape) == (1, 1199, 1312, 3), "svg placeholder uses API-reported size")
+    try:
+        node.generate(prompt="p", model="gpt-image-2.6-flare", quality="low", size="auto",
+                      output_format="svg", n=1, image_1=torch.rand(1, 32, 32, 3), **base)
+        check(False, "control: svg with references rejected")
+    except ValueError:
+        check(True, "control: svg with references rejected")
+
+    # markup: LoadImage pair -> transparent PNG part sized to image_1
+    CAPTURED.clear()
+    fake_requests.post = make_fake_post(usage={"output_tokens": 10})
+    mk = torch.zeros(1, 50, 80, 3); mk[0, 10:20, 10:20, 0] = 1.0
+    mk_mask = torch.ones(1, 50, 80); mk_mask[0, 10:20, 10:20] = 0.0   # opaque only where drawn
+    node.generate(prompt="remove the circled vase", model="gpt-image-2.6-flare", quality="low", size="auto",
+                  output_format="png", n=1, image_1=torch.rand(1, 100, 160, 3),
+                  markup=mk, markup_mask=mk_mask, **base)
+    parts = {f[0]: f[1] for f in CAPTURED[-1]["files"]}
+    check("markup" in parts and "mask" not in parts, "markup multipart part present")
+    mpil = Image.open(io.BytesIO(parts["markup"][1]))
+    a = np.array(mpil.getchannel("A"))
+    check(mpil.mode == "RGBA" and mpil.size == (160, 100), f"markup RGBA at image_1 size {mpil.size}")
+    check(a[30, 30] > 200 and a[90, 150] == 0, "markup alpha: drawn opaque, rest transparent")
+    for bad, label in ((dict(markup_mask=None), "markup without mask rejected"),
+                       (dict(markup_mask=torch.zeros(1, 50, 80)), "flattened (opaque) markup rejected"),
+                       (dict(markup_mask=mk_mask, mask=torch.ones(1, 100, 160)), "markup + mask rejected")):
+        try:
+            node.generate(prompt="p", model="gpt-image-2.6-flare", quality="low", size="auto", output_format="png",
+                          n=1, image_1=torch.rand(1, 100, 160, 3), markup=mk, **{**base, **bad})
+            check(False, label)
+        except ValueError:
+            check(True, label)
 
 
 def run_live():
@@ -254,7 +354,7 @@ def run_live():
     os.environ.pop("OPENAI_API_KEY", None) if os.environ.get("OPENAI_API_KEY") == "sk-test-not-real" else None
     node = gid.GPTImageGenerate()
     print("[live] one gpt-image-2.6-flare low 1024x1024 call")
-    imgs, masks, cost_info, _ = node.generate(
+    imgs, masks, cost_info, _, _ = node.generate(
         prompt="a single matte black ceramic cup on raw concrete, soft north light",
         model="gpt-image-2.6-flare", quality="low", size="1024x1024",
         custom_width=1024, custom_height=1024, background="auto", output_format="png",

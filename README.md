@@ -19,10 +19,12 @@ Category: `AKURATE/GPT Image Direct`
 ### Inputs
 
 - `model`: `gpt-image-2.6-flare` (default; fast, everyday), `gpt-image-2.6-sunburst` (slower, more precise text and layouts), `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1-mini`. Flare and Sunburst cost the same per token.
-- `quality`: `low`, `medium`, `high`, `xhigh`, `max`, `auto`. This is the cost lever. Rough 1024x1024 prices at list rate: low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21. `xhigh` and `max` exist on 2.5 and 2.6 only; other models fall back to `high`.
+- `quality`: `low`, `medium`, `high`, `xhigh`, `max`, `auto`. This is the cost lever. 1024x1024 prices at list rate on 2.6 (measured, same for Flare and Sunburst): low ~$0.025, medium ~$0.043, high ~$0.053, xhigh ~$0.094, max ~$0.21. On 2.5, low and medium are cheaper (~$0.006, ~$0.02). Sunburst is slower, not dearer: max took 174 s against Flare's 37 s. `xhigh` and `max` exist on 2.5 and 2.6 only; other models fall back to `high`.
 - `size`: presets up to 3840x2160 or `custom` (multiples of 16, aspect 1:3 to 3:1, 480 to 3840 px per edge). Legacy models fall back to 1024x1024 for sizes they lack.
 - `background`: `auto`, `opaque`, `transparent` (forces png or webp; the alpha lands on the `mask` output).
-- `output_format` and `output_compression`: png, jpeg or webp. File format only, no effect on cost.
+- `output_format` and `output_compression`: png, jpeg or webp (file format only, no effect on cost), plus two 2.6-only formats:
+  - `gif`: an animated GIF. Its frames come out as an IMAGE batch and the .gif is saved untouched. Set `frame_count` (2 to 16) and `frame_duration_ms` (20 to 2000). No mask. OpenAI packs the frames into one sheet, and its longest edge must be 3840 px or less, so size presets are ignored and `auto` is sent (512 px frames in testing). Use `custom` to set the frame size yourself. Your OpenAI project needs GIF preview access.
+  - `svg`: a vector. Generation only (no references), one per run. The SVG text comes out on the `svg` output and is saved as a .svg file. ComfyUI has no SVG rasterizer, so `images` gets a grey placeholder. OpenAI renders a raster reference first (billed as usual, set by `quality`) and then writes the SVG. `svg_model` (default `gpt-5.4-mini`) picks the text model that writes the SVG. Its tokens are listed in `cost_info` but not priced, so check your OpenAI usage page for that part. Leave `svg_model` empty if your project has no SVG model selection.
 - `moderation`: `auto` or `low`.
 - `n`: images per run, 1 to 8.
 - `seed`: not sent to OpenAI (the API has no seed). Changing it forces a re-run and a fresh `cache_key`.
@@ -30,14 +32,17 @@ Category: `AKURATE/GPT Image Direct`
 - `mask` (optional): white = repaint. Needs exactly one reference image. Auto-resized to the reference.
 - `reference_max_size`: downscale references before upload (2048 default). Smaller references mean fewer input tokens.
 - `input_fidelity`: `auto` (not sent), `low`, `high`. Edits only. High keeps more of the reference but costs more input tokens.
+- `complexity` (2.6 only): `auto` (not sent, the API uses `high`), `low`, `medium`, `high`. Sets how much the model plans before rendering, separately from `quality`. There is no extra fee, and lower settings are faster.
+- `markup` + `markup_mask` (optional, 2.5 and 2.6): markup-guided edits. Draw circles or sketches on a separate transparent PNG over `image_1` and load it with Load Image. Wire its IMAGE to `markup` and its MASK to `markup_mask`, then describe the change in the prompt. Markup can't be combined with `mask`, and it is resized to `image_1` automatically.
 - `api_key`, `api_base`, `timeout_sec`: override the key, point at an OpenAI-compatible base URL (Azure, fal, a proxy), and give slow max-quality 4K runs more time.
 
 ### Outputs
 
-- `images`: IMAGE batch.
+- `images`: IMAGE batch (GIF frames in order; a grey placeholder for svg).
 - `mask`: MASK, 1 where the image is transparent (same convention as Load Image).
 - `cost_info`: `"$0.0528 USD (exact) | gpt-image-2.5-flare high 1536x1024 x1 | 14.2s | tokens: 24 text-in, 0 img-in, 0 cached, 1756 out | gpt_image_20260919_120000_00.png"`. Exact when the API returns `usage`, otherwise labelled `(estimated)`.
-- `cache_key`: deterministic string of every input, for Hash Vault in ComfyUI-API-Optimizer.
+- `cache_key`: deterministic string of every input, for Hash Vault in ComfyUI-API-Optimizer. The 2.6 settings are added only when changed from their defaults, so keys from older workflows stay the same.
+- `svg`: the SVG source when `output_format` is svg, otherwise empty.
 
 Images are also saved to `output/gpt_image_direct/`.
 

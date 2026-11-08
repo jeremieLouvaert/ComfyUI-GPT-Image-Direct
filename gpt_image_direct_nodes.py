@@ -7,6 +7,8 @@ your own API key.
 
   - GPT Image 2.6 and 2.5 Flare / Sunburst, GPT Image 2, 1.5 and 1-mini
   - Text-to-image and reference-image editing (up to 16 refs) with optional mask
+  - GPT Image 2.6 extras: complexity control, animated GIF and SVG output,
+    markup-guided edits (markup also works on 2.5)
   - Exact USD cost per run computed from the API's own `usage` token counts
   - Zero extra dependencies: uses `requests` + Pillow, both shipped with ComfyUI
 
@@ -23,7 +25,7 @@ import time
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageSequence
 
 try:
     import requests
@@ -70,6 +72,9 @@ PRICE_PER_1M = {
 # Rough pre-flight estimate of OUTPUT tokens per quality at ~1MP so the console
 # shows an expected cost before the call. The post-call figure is exact.
 EST_OUTPUT_TOKENS = {"low": 196, "medium": 620, "high": 1756, "xhigh": 3000, "max": 7024, "auto": 620}
+# 2.6 measured live 2026-11-08 at 1024x1024: identical for Flare and Sunburst, and unchanged
+# by complexity. low/medium render far more tokens than 2.5.
+EST_OUTPUT_TOKENS_26 = {"low": 824, "medium": 1449, "high": 1757, "xhigh": 3122, "max": 7024, "auto": 1449}
 
 QUALITIES_25 = ["auto", "low", "medium", "high", "xhigh", "max"]
 QUALITIES_LEGACY = ["auto", "low", "medium", "high"]
@@ -101,6 +106,18 @@ MODEL_QUALITIES = {
     "gpt-image-1.5": QUALITIES_LEGACY,
     "gpt-image-1-mini": QUALITIES_LEGACY,
 }
+
+# 2.6-only request features, per the OpenAI image generation guide (checked 2026-11-08).
+MODELS_26 = {"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
+# Markup-guided edits are documented for 2.5 and 2.6.
+MARKUP_MODELS = MODELS_26 | {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+OUTPUT_FORMATS = ["png", "jpeg", "webp", "gif", "svg"]
+COMPLEXITIES = ["auto", "low", "medium", "high"]
+GIF_FRAMES_MIN, GIF_FRAMES_MAX = 2, 16
+GIF_DURATION_MIN, GIF_DURATION_MAX = 20, 2000
+# Text model that writes the SVG (svg.model). Projects with SVG model selection must send
+# one; any text model the key can use works. Mini is the cheap choice.
+DEFAULT_SVG_MODEL = "gpt-5.4-mini"
 
 # Custom-size constraints for the 2.x line (mirrors OpenAI's documented limits).
 CUSTOM_MIN_EDGE = 480
@@ -207,12 +224,23 @@ def _get_output_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 
-def _save_image(pil_img, ext, index):
+def _output_path(ext, index):
     out_dir = os.path.join(_get_output_dir(), "gpt_image_direct")
     os.makedirs(out_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"gpt_image_{stamp}_{index:02d}.{ext}"
-    filepath = os.path.join(out_dir, filename)
+    return os.path.join(out_dir, f"gpt_image_{stamp}_{index:02d}.{ext}")
+
+
+def _save_bytes(raw, ext, index):
+    """Save the API's bytes untouched (GIF animation, SVG text)."""
+    filepath = _output_path(ext, index)
+    with open(filepath, "wb") as f:
+        f.write(raw)
+    return filepath
+
+
+def _save_image(pil_img, ext, index):
+    filepath = _output_path(ext, index)
     save_img = pil_img
     if ext == "jpg" and pil_img.mode == "RGBA":
         save_img = pil_img.convert("RGB")
@@ -297,7 +325,8 @@ def compute_cost(model, usage):
 def estimate_cost(model, quality, n, n_refs):
     """Pre-flight rough estimate (output tokens at ~1MP; refs ~1000 tokens each)."""
     rates = PRICE_PER_1M.get(model, PRICE_PER_1M["gpt-image-2"])
-    out_tokens = EST_OUTPUT_TOKENS.get(quality, 620) * n
+    table = EST_OUTPUT_TOKENS_26 if model in MODELS_26 else EST_OUTPUT_TOKENS
+    out_tokens = table.get(quality, table["auto"]) * n
     in_tokens = 1000 * n_refs + 50
     return (out_tokens * rates["image_out"] + in_tokens * rates["image_in"]) / 1_000_000.0
 
@@ -346,7 +375,8 @@ def _post(url, api_key, timeout, json_body=None, data=None, files=None):
 
 
 def build_generation_payload(model, prompt, quality, size, background, output_format,
-                             output_compression, moderation, n):
+                             output_compression, moderation, n, complexity="auto",
+                             frame_count=9, frame_duration_ms=200, svg_model=""):
     payload = {
         "model": model,
         "prompt": prompt,
@@ -361,10 +391,40 @@ def build_generation_payload(model, prompt, quality, size, background, output_fo
         payload["background"] = background
     if output_format in ("jpeg", "webp"):
         payload["output_compression"] = int(output_compression)
+    if complexity != "auto":
+        payload["complexity"] = complexity
+    if output_format == "gif":
+        payload["frame_count"] = int(frame_count)
+        payload["frame_duration_ms"] = int(frame_duration_ms)
+    if output_format == "svg" and svg_model.strip():
+        payload["svg"] = {"model": svg_model.strip()}
     return payload
 
 
-def build_edit_files(ref_pils, mask_tensor):
+def build_markup_rgba(markup, markup_mask, size):
+    """LoadImage pair (IMAGE + MASK, mask = 1 - alpha) -> the transparent annotation PNG
+    the API wants, sized to the (possibly downscaled) first reference."""
+    if markup_mask is None:
+        raise ValueError(
+            f"{LOG} markup needs markup_mask. Load the transparent markup PNG with LoadImage "
+            "and wire its IMAGE to markup and its MASK to markup_mask.")
+    rgb = _tensor_to_pil(markup[0] if markup.dim() == 4 else markup)
+    m = markup_mask[0] if markup_mask.dim() == 3 else markup_mask
+    alpha = Image.fromarray(((1.0 - m.detach().cpu().numpy().clip(0, 1)) * 255.0).astype(np.uint8), "L")
+    if alpha.size != rgb.size:
+        alpha = alpha.resize(rgb.size, Image.NEAREST)
+    if int(np.array(alpha).min()) == 255:
+        raise ValueError(
+            f"{LOG} markup has no transparent pixels. It must be a separate transparent PNG "
+            "holding only your circles/sketches, not flattened onto the photo.")
+    rgba = rgb.convert("RGBA")
+    rgba.putalpha(alpha)
+    if rgba.size != size:
+        rgba = rgba.resize(size, Image.LANCZOS)
+    return rgba
+
+
+def build_edit_files(ref_pils, mask_tensor, markup_rgba=None):
     """Multipart file tuples for /images/edits. Mask (B,H,W float, 1 = edit) becomes
     an RGBA PNG whose alpha is 0 where the model should repaint."""
     files = []
@@ -385,6 +445,8 @@ def build_edit_files(ref_pils, mask_tensor):
         rgba = Image.new("RGBA", ref.size, (0, 0, 0, 255))
         rgba.putalpha(alpha)
         files.append(("mask", ("mask.png", _png_bytes(rgba), "image/png")))
+    if markup_rgba is not None:
+        files.append(("markup", ("markup.png", _png_bytes(markup_rgba), "image/png")))
     return files
 
 
@@ -407,12 +469,12 @@ class GPTImageGenerate:
                 "model": (MODELS, {"default": "gpt-image-2.6-flare",
                                    "tooltip": "Flare: fastest, everyday quality. Sunburst: slower, more precise (text, layouts, heavy edits). Same price per token."}),
                 "quality": (QUALITIES_25, {"default": "low",
-                                           "tooltip": "Biggest cost lever. low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21 per 1MP image. xhigh/max are 2.5/2.6 only."}),
+                                           "tooltip": "Biggest cost lever, per 1MP image. 2.6: low ~$0.025, medium ~$0.043, high ~$0.053, xhigh ~$0.094, max ~$0.21. 2.5: low ~$0.006, medium ~$0.02. xhigh/max are 2.5/2.6 only."}),
                 "size": (SIZES_2X, {"default": "1024x1024", "tooltip": "auto lets the model pick. 2048+/4K/custom are 2.x only."}),
                 "custom_width": ("INT", {"default": 1024, "min": CUSTOM_MIN_EDGE, "max": CUSTOM_MAX_EDGE, "step": 16, "tooltip": "Used when size = custom. Multiple of 16, aspect <= 3:1."}),
                 "custom_height": ("INT", {"default": 1024, "min": CUSTOM_MIN_EDGE, "max": CUSTOM_MAX_EDGE, "step": 16, "tooltip": "Used when size = custom."}),
                 "background": (["auto", "opaque", "transparent"], {"default": "auto", "tooltip": "transparent needs png or webp; alpha comes out on the mask output."}),
-                "output_format": (["png", "jpeg", "webp"], {"default": "png", "tooltip": "File format returned and saved. Does not change cost."}),
+                "output_format": (OUTPUT_FORMATS, {"default": "png", "tooltip": "File format returned and saved. gif (2.6): animation, frames come out as an image batch. svg (2.6, no references): vector on the svg output, images gets a grey placeholder."}),
                 "output_compression": ("INT", {"default": 90, "min": 0, "max": 100, "step": 1, "tooltip": "jpeg/webp only."}),
                 "moderation": (["auto", "low"], {"default": "low", "tooltip": "Content filter strictness."}),
                 "n": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1, "tooltip": "Images per run. Cost scales linearly."}),
@@ -431,11 +493,17 @@ class GPTImageGenerate:
                 "api_key": ("STRING", {"default": "", "tooltip": "Overrides OPENAI_API_KEY env var and openai_api_key.txt in the ComfyUI root."}),
                 "api_base": ("STRING", {"default": DEFAULT_API_BASE, "tooltip": "OpenAI-compatible base URL (Azure/fal/proxy)."}),
                 "timeout_sec": ("INT", {"default": 300, "min": 30, "max": 1800, "step": 10, "tooltip": "max quality at 4K on Sunburst can take minutes."}),
+                "complexity": (COMPLEXITIES, {"default": "auto", "tooltip": "2.6 only. How much the model plans before rendering, separate from quality. No extra fee; lower is faster. auto = don't send (API default high)."}),
+                "frame_count": ("INT", {"default": 9, "min": GIF_FRAMES_MIN, "max": GIF_FRAMES_MAX, "step": 1, "tooltip": "gif only. Frames per animation."}),
+                "frame_duration_ms": ("INT", {"default": 200, "min": GIF_DURATION_MIN, "max": GIF_DURATION_MAX, "step": 10, "tooltip": "gif only. Milliseconds per frame."}),
+                "svg_model": ("STRING", {"default": DEFAULT_SVG_MODEL, "tooltip": "svg only. Text model that writes the SVG from the rendered reference (billed at its own rate). Empty = don't send, for projects without SVG model selection."}),
+                "markup": ("IMAGE", {"tooltip": "2.5/2.6 edits. Transparent PNG of circles/sketches over image_1, loaded with LoadImage. Wire its MASK to markup_mask."}),
+                "markup_mask": ("MASK", {"tooltip": "The MASK output of the LoadImage that loaded markup (carries its transparency)."}),
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING")
-    RETURN_NAMES = ("images", "mask", "cost_info", "cache_key")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("images", "mask", "cost_info", "cache_key", "svg")
     FUNCTION = "generate"
     CATEGORY = CATEGORY
 
@@ -443,7 +511,9 @@ class GPTImageGenerate:
                  output_format, output_compression, moderation, n, seed,
                  image_1=None, image_2=None, image_3=None, image_4=None,
                  images=None, mask=None, reference_max_size="2048", input_fidelity="auto",
-                 api_key="", api_base=DEFAULT_API_BASE, timeout_sec=300):
+                 api_key="", api_base=DEFAULT_API_BASE, timeout_sec=300,
+                 complexity="auto", frame_count=9, frame_duration_ms=200,
+                 markup=None, markup_mask=None, svg_model=DEFAULT_SVG_MODEL):
 
         if not prompt or not prompt.strip():
             raise ValueError(f"{LOG} prompt is empty")
@@ -458,6 +528,21 @@ class GPTImageGenerate:
         if background == "transparent" and output_format == "jpeg":
             print(f"{LOG} transparent background needs png/webp, switching output_format to png")
             output_format = "png"
+
+        is_gif, is_svg = output_format == "gif", output_format == "svg"
+        if (is_gif or is_svg) and model not in MODELS_26:
+            raise ValueError(f"{LOG} {output_format} output needs a GPT Image 2.6 model, got {model}")
+        if complexity != "auto" and model not in MODELS_26:
+            print(f"{LOG} complexity is a 2.6 setting, not sent for {model}")
+            complexity = "auto"
+        if is_gif and size != "custom" and size_str:
+            # Frames are packed into one sheet whose long edge must stay <= 3840 px, so
+            # 1024+ presets fail past 3 frames. auto lets OpenAI pick (512px seen live).
+            print(f"{LOG} gif: size preset {size_str} ignored, sending auto (use custom to set the frame size)")
+            size_str = None
+        if is_svg and n != 1:
+            print(f"{LOG} svg output returns one image, n forced to 1")
+            n = 1
 
         # --- reference images ---------------------------------------------------
         ref_pils = []
@@ -474,16 +559,39 @@ class GPTImageGenerate:
                 hasher.update(pil.tobytes()[::97])
             if mask is not None:
                 hasher.update(mask.detach().cpu().numpy().tobytes()[::97])
+            if markup is not None:
+                hasher.update(markup.detach().cpu().numpy().tobytes()[::97])
+                if markup_mask is not None:
+                    hasher.update(markup_mask.detach().cpu().numpy().tobytes()[::97])
             ref_hash = hasher.hexdigest()[:12]
             print(f"{LOG} {len(ref_pils)} reference image(s) attached"
                   f"{' + mask' if mask is not None else ''} (max edge {reference_max_size})")
         elif mask is not None:
             raise ValueError(f"{LOG} a mask needs a reference image on the images input")
 
+        if is_svg and ref_pils:
+            raise ValueError(f"{LOG} svg output is generation-only: disconnect the reference images")
+        if is_gif and mask is not None:
+            raise ValueError(f"{LOG} gif output does not take a mask")
+        markup_rgba = None
+        if markup is not None:
+            if model not in MARKUP_MODELS:
+                raise ValueError(f"{LOG} markup edits need a GPT Image 2.5 or 2.6 model, got {model}")
+            if not ref_pils:
+                raise ValueError(f"{LOG} markup draws over image_1: connect a reference image")
+            if mask is not None:
+                raise ValueError(f"{LOG} markup and mask can't be combined, use one or the other")
+            markup_rgba = build_markup_rgba(markup, markup_mask, ref_pils[0].size)
+            print(f"{LOG} markup attached over image_1 ({markup_rgba.size[0]}x{markup_rgba.size[1]})")
+
         cache_key = "|".join([
             model, quality, size_str or "auto", background, output_format,
-            str(n), str(seed), ref_hash, prompt,
-        ])
+            str(n), str(seed), ref_hash,
+        ]
+            + ([f"complexity={complexity}"] if complexity != "auto" else [])
+            + ([f"gif={frame_count}x{frame_duration_ms}ms"] if is_gif else [])
+            + ([f"svg={svg_model.strip()}"] if is_svg else [])
+            + [prompt])
 
         est = estimate_cost(model, quality, n, len(ref_pils))
         print(f"{LOG} {model} | quality={quality} | size={size_str or 'auto'} | n={n} | est. ~${est:.4f}")
@@ -492,14 +600,16 @@ class GPTImageGenerate:
         start = time.time()
         if ref_pils:
             data = build_generation_payload(model, prompt, quality, size_str, background,
-                                            output_format, output_compression, moderation, n)
+                                            output_format, output_compression, moderation, n,
+                                            complexity, frame_count, frame_duration_ms)
             if input_fidelity != "auto":
                 data["input_fidelity"] = input_fidelity
-            files = build_edit_files(ref_pils, mask)
+            files = build_edit_files(ref_pils, mask, markup_rgba)
             result = _post(f"{base}/images/edits", resolved_key, timeout_sec, data=data, files=files)
         else:
             payload = build_generation_payload(model, prompt, quality, size_str, background,
-                                               output_format, output_compression, moderation, n)
+                                               output_format, output_compression, moderation, n,
+                                               complexity, frame_count, frame_duration_ms, svg_model)
             result = _post(f"{base}/images/generations", resolved_key, timeout_sec, json_body=payload)
         elapsed = time.time() - start
 
@@ -508,13 +618,31 @@ class GPTImageGenerate:
         if not items:
             raise RuntimeError(f"{LOG} API returned no images: {json.dumps(result)[:400]}")
 
-        ext = {"png": "png", "jpeg": "jpg", "webp": "webp"}[output_format]
-        image_tensors, mask_tensors, saved = [], [], []
+        ext = {"png": "png", "jpeg": "jpg", "webp": "webp", "gif": "gif", "svg": "svg"}[output_format]
+        image_tensors, mask_tensors, saved, svg_texts = [], [], [], []
         for idx, item in enumerate(items):
             b64 = item.get("b64_json")
             if not b64:
                 raise RuntimeError(f"{LOG} image {idx} has no b64_json payload: {json.dumps(item)[:200]}")
-            pil = Image.open(io.BytesIO(base64.b64decode(b64)))
+            raw = base64.b64decode(b64)
+            if is_svg:
+                # No rasterizer ships with ComfyUI: the vector goes out as text + .svg file,
+                # IMAGE gets a grey placeholder at the requested size.
+                svg_texts.append(raw.decode("utf-8"))
+                saved.append(os.path.basename(_save_bytes(raw, "svg", idx)))
+                reported = result.get("size") or size_str
+                pw, ph = _parse_size(reported) if reported and "x" in reported else (1024, 1024)
+                image_tensors.append(torch.full((1, ph, pw, 3), 0.5))
+                mask_tensors.append(torch.zeros((1, ph, pw)))
+                continue
+            if is_gif:
+                saved.append(os.path.basename(_save_bytes(raw, "gif", idx)))
+                for frame in ImageSequence.Iterator(Image.open(io.BytesIO(raw))):
+                    img_t, mask_t = _pil_to_tensors(frame.convert("RGBA"))
+                    image_tensors.append(img_t)
+                    mask_tensors.append(mask_t)
+                continue
+            pil = Image.open(io.BytesIO(raw))
             pil.load()
             if pil.mode not in ("RGB", "RGBA"):
                 pil = pil.convert("RGBA" if "A" in pil.getbands() else "RGB")
@@ -541,14 +669,18 @@ class GPTImageGenerate:
         if not usage:
             usd = est
         w, h = out_images.shape[2], out_images.shape[1]
+        count = f"x{len(items)}" + (f" ({out_images.shape[0]} frames)" if is_gif else "")
+        svg_usage = result.get("svg_usage") or {}
+        svg_note = (f" | +{svg_usage.get('total_tokens', 0)} SVG-authoring tokens on {svg_usage.get('model', '?')}, "
+                    "not included above") if svg_usage else ""
         cost_info = (
-            f"${usd:.4f} USD ({cost_source}) | {model} {quality} {w}x{h} x{len(items)} | {elapsed:.1f}s | "
+            f"${usd:.4f} USD ({cost_source}) | {model} {quality} {w}x{h} {count} | {elapsed:.1f}s | "
             f"tokens: {tokens['text_in']} text-in, {tokens['image_in']} img-in, "
-            f"{tokens['cached_in']} cached, {tokens['out']} out | {', '.join(saved)}"
+            f"{tokens['cached_in']} cached, {tokens['out']} out{svg_note} | {', '.join(saved)}"
         )
         print(f"{LOG} Done. {cost_info}")
 
-        return (out_images, out_masks, cost_info, cache_key)
+        return (out_images, out_masks, cost_info, cache_key, "\n".join(svg_texts))
 
 
 # ============================================================================
