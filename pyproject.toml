@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-gpt-image-direct"
-description = "Direct OpenAI GPT Image 2.5 (Flare / Sunburst), GPT Image 2, 1.5 and 1-mini generation and editing with your own API key: no credits middleman, exact USD cost per run"
-version = "1.2.0"
+description = "Direct OpenAI GPT Image 2.6 and 2.5 (Flare / Sunburst), GPT Image 2, 1.5 and 1-mini generation and editing with your own API key: animated GIF, SVG and markup edits on 2.6, no credits middleman, exact USD cost per run"
+version = "1.2.1"
 license = { file = "LICENSE" }
 dependencies = ["requests", "Pillow"]
 
