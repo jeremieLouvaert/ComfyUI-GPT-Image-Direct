@@ -5,7 +5,7 @@ Direct OpenAI Images API node for ComfyUI. Bypasses the Comfy.org credit
 system (and its markup) by calling https://api.openai.com/v1/images/* with
 your own API key.
 
-  - GPT Image 2.5 Flare / Sunburst, GPT Image 2, 1.5 and 1-mini
+  - GPT Image 2.6 and 2.5 Flare / Sunburst, GPT Image 2, 1.5 and 1-mini
   - Text-to-image and reference-image editing (up to 16 refs) with optional mask
   - Exact USD cost per run computed from the API's own `usage` token counts
   - Zero extra dependencies: uses `requests` + Pillow, both shipped with ComfyUI
@@ -46,6 +46,8 @@ LOG = "[GPT Image Direct]"
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 
 MODELS = [
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
     "gpt-image-2",
@@ -53,9 +55,11 @@ MODELS = [
     "gpt-image-1-mini",
 ]
 
-# USD per 1M tokens, from developers.openai.com/api/docs/pricing (2026-09-19).
+# USD per 1M tokens, from developers.openai.com/api/docs/pricing (2.6 rows checked 2026-11-08).
 # Keys: text_in, cached_in, image_in, image_out.
 PRICE_PER_1M = {
+    "gpt-image-2.6-flare":    {"text_in": 5.00, "cached_in": 1.25, "image_in": 8.00, "image_out": 30.00},
+    "gpt-image-2.6-sunburst": {"text_in": 5.00, "cached_in": 1.25, "image_in": 8.00, "image_out": 30.00},
     "gpt-image-2.5-flare":    {"text_in": 5.00, "cached_in": 1.25, "image_in": 8.00, "image_out": 30.00},
     "gpt-image-2.5-sunburst": {"text_in": 5.00, "cached_in": 1.25, "image_in": 8.00, "image_out": 30.00},
     "gpt-image-2":            {"text_in": 5.00, "cached_in": 1.25, "image_in": 8.00, "image_out": 30.00},
@@ -80,6 +84,8 @@ SIZES_2X = [
 SIZES_LEGACY = ["auto", "1024x1024", "1024x1536", "1536x1024"]
 
 MODEL_SIZES = {
+    "gpt-image-2.6-flare": SIZES_2X,
+    "gpt-image-2.6-sunburst": SIZES_2X,
     "gpt-image-2.5-flare": SIZES_2X,
     "gpt-image-2.5-sunburst": SIZES_2X,
     "gpt-image-2": SIZES_2X,
@@ -87,6 +93,8 @@ MODEL_SIZES = {
     "gpt-image-1-mini": SIZES_LEGACY,
 }
 MODEL_QUALITIES = {
+    "gpt-image-2.6-flare": QUALITIES_25,
+    "gpt-image-2.6-sunburst": QUALITIES_25,
     "gpt-image-2.5-flare": QUALITIES_25,
     "gpt-image-2.5-sunburst": QUALITIES_25,
     "gpt-image-2": QUALITIES_LEGACY,
@@ -239,7 +247,7 @@ def _resolve_size(model, size, custom_width, custom_height):
     if size == "auto":
         return None
     if size == "custom":
-        if model not in ("gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "gpt-image-2"):
+        if "custom" not in MODEL_SIZES.get(model, SIZES_LEGACY):
             print(f"{LOG} {model} has no custom sizes, falling back to 1024x1024")
             return "1024x1024"
         _validate_custom_size(custom_width, custom_height)
@@ -396,10 +404,10 @@ class GPTImageGenerate:
         return {
             "required": {
                 "prompt": ("STRING", {"multiline": True, "default": "", "tooltip": "What to generate, or how to edit the reference images."}),
-                "model": (MODELS, {"default": "gpt-image-2.5-flare",
+                "model": (MODELS, {"default": "gpt-image-2.6-flare",
                                    "tooltip": "Flare: fastest, everyday quality. Sunburst: slower, more precise (text, layouts, heavy edits). Same price per token."}),
                 "quality": (QUALITIES_25, {"default": "low",
-                                           "tooltip": "Biggest cost lever. low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21 per 1MP image. xhigh/max are 2.5 only."}),
+                                           "tooltip": "Biggest cost lever. low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21 per 1MP image. xhigh/max are 2.5/2.6 only."}),
                 "size": (SIZES_2X, {"default": "1024x1024", "tooltip": "auto lets the model pick. 2048+/4K/custom are 2.x only."}),
                 "custom_width": ("INT", {"default": 1024, "min": CUSTOM_MIN_EDGE, "max": CUSTOM_MAX_EDGE, "step": 16, "tooltip": "Used when size = custom. Multiple of 16, aspect <= 3:1."}),
                 "custom_height": ("INT", {"default": 1024, "min": CUSTOM_MIN_EDGE, "max": CUSTOM_MAX_EDGE, "step": 16, "tooltip": "Used when size = custom."}),

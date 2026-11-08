@@ -1,6 +1,6 @@
 # ComfyUI-GPT-Image-Direct
 
-**OpenAI GPT Image 2.5 (Flare and Sunburst), GPT Image 2, 1.5 and 1-mini in ComfyUI, on your own API key.**
+**OpenAI GPT Image 2.6 and 2.5 (Flare and Sunburst), GPT Image 2, 1.5 and 1-mini in ComfyUI, on your own API key.**
 
 No Comfy credits, no middleman, no markup. One node, text-to-image and reference editing, exact USD cost printed after every run.
 
@@ -18,8 +18,8 @@ Category: `AKURATE/GPT Image Direct`
 
 ### Inputs
 
-- `model`: `gpt-image-2.5-flare` (fast, everyday), `gpt-image-2.5-sunburst` (slower, more precise text and layouts), `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1-mini`. Flare and Sunburst cost the same per token.
-- `quality`: `low`, `medium`, `high`, `xhigh`, `max`, `auto`. This is the cost lever. Rough 1024x1024 prices at list rate: low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21. `xhigh` and `max` exist on 2.5 only; other models fall back to `high`.
+- `model`: `gpt-image-2.6-flare` (default; fast, everyday), `gpt-image-2.6-sunburst` (slower, more precise text and layouts), `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst`, `gpt-image-2`, `gpt-image-1.5`, `gpt-image-1-mini`. Flare and Sunburst cost the same per token.
+- `quality`: `low`, `medium`, `high`, `xhigh`, `max`, `auto`. This is the cost lever. Rough 1024x1024 prices at list rate: low ~$0.006, medium ~$0.02, high ~$0.05, max ~$0.21. `xhigh` and `max` exist on 2.5 and 2.6 only; other models fall back to `high`.
 - `size`: presets up to 3840x2160 or `custom` (multiples of 16, aspect 1:3 to 3:1, 480 to 3840 px per edge). Legacy models fall back to 1024x1024 for sizes they lack.
 - `background`: `auto`, `opaque`, `transparent` (forces png or webp; the alpha lands on the `mask` output).
 - `output_format` and `output_compression`: png, jpeg or webp. File format only, no effect on cost.
@@ -67,10 +67,11 @@ Get a key at https://platform.openai.com/api-keys. GPT Image models need a one-t
 
 ## Pricing reference
 
-USD per 1M tokens, OpenAI list price as of 2026-09-19:
+USD per 1M tokens, OpenAI list price as of 2026-11-08:
 
 | Model | Text in | Cached in | Image in | Image out |
 |-------|---------|-----------|----------|-----------|
+| gpt-image-2.6-flare / sunburst | 5.00 | 1.25 | 8.00 | 30.00 |
 | gpt-image-2.5-flare / sunburst | 5.00 | 1.25 | 8.00 | 30.00 |
 | gpt-image-2 | 5.00 | 1.25 | 8.00 | 30.00 |
 | gpt-image-1.5 | 5.00 | 1.25 | 8.00 | 32.00 |
@@ -82,7 +83,7 @@ The node multiplies the `usage` counts the API returns by this table. Update `PR
 
 ```
 python tools/test_gpt_image_direct.py          # offline, mocked HTTP, no spend
-python tools/test_gpt_image_direct.py --live   # plus one real low-quality Flare call (~$0.006)
+python tools/test_gpt_image_direct.py --live   # plus one real low-quality 2.6 Flare call (~$0.025)
 ```
 
 ## License

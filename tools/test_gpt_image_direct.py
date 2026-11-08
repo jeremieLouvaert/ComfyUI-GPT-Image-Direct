@@ -253,10 +253,10 @@ def run_live():
         pass
     os.environ.pop("OPENAI_API_KEY", None) if os.environ.get("OPENAI_API_KEY") == "sk-test-not-real" else None
     node = gid.GPTImageGenerate()
-    print("[live] one gpt-image-2.5-flare low 1024x1024 call")
+    print("[live] one gpt-image-2.6-flare low 1024x1024 call")
     imgs, masks, cost_info, _ = node.generate(
         prompt="a single matte black ceramic cup on raw concrete, soft north light",
-        model="gpt-image-2.5-flare", quality="low", size="1024x1024",
+        model="gpt-image-2.6-flare", quality="low", size="1024x1024",
         custom_width=1024, custom_height=1024, background="auto", output_format="png",
         output_compression=90, moderation="low", n=1, seed=1)
     check(imgs.shape[1:] == (1024, 1024, 3), f"live image shape {tuple(imgs.shape)}")
